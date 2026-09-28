@@ -1,0 +1,46 @@
+# auth-session-rotation-python
+
+一个**纯本地可运行**的身份认证与访问控制示例服务（FastAPI）：
+
+- 登录签发访问令牌 + 刷新令牌；刷新时**轮换**刷新令牌；
+- 刷新令牌被**重用**（用过再次出现）时撤销整条会话；
+- 令牌**过期 / 被篡改 / 时钟偏差**返回可区分的错误码；
+- 基于角色 + 权限的访问控制，**未登录 (401) 与权限不足 (403) 严格区分**；
+- 角色/权限变更对所有**已签发会话立即生效**（授权实时读取，不信令牌快照）；
+- 支持撤销**单个会话**与撤销**某用户全部会话**；
+- 并发刷新同一刷新令牌时**只有一个请求成功**；
+- 所有关键认证/撤销事件写入本地 JSONL 审计日志，含判定依据。
+
+无外部服务、无真实凭据、无付费依赖；令牌签名与密码哈希均使用 Python 标准库，
+数据保存在进程内存。
+
+## 快速开始
+
+```bash
+python3 main.py                 # 启动在 http://127.0.0.1:8000
+python3 -m pytest -s            # 运行测试并打印关键审计事件
+```
+
+演示账号（仅本地）：`admin/admin123`、`editor/editor123`、`viewer/viewer123`。
+
+## 目录结构
+
+```
+auth_app/
+  errors.py    # 可区分的错误类型（过期/篡改/时钟偏差/重放/401/403…）
+  models.py    # User / Session / RefreshTokenRecord / TokenPair
+  tokens.py    # HMAC 自签名令牌签发与校验
+  rbac.py      # 角色-权限映射与实时授权判定
+  service.py   # 登录、刷新轮换、重放检测、撤销（唯一判定来源）
+  store.py     # 线程安全内存存储
+  audit.py     # JSONL 审计日志
+  security.py  # PBKDF2 密码哈希、令牌摘要
+  clock.py     # 可平移时钟（测试用）
+  config.py    # 环境变量配置
+  bootstrap.py # 装配与演示用户
+  api.py       # FastAPI 路由
+tests/         # 32 个场景测试
+docs/AUTH.md   # 完整设计与语义说明（务必阅读）
+```
+
+完整流程、撤销语义、权限模型与本地验证步骤见 **[docs/AUTH.md](docs/AUTH.md)**。
