@@ -112,3 +112,22 @@ class Store:
     def snapshot_refresh_by_hash(self) -> dict[str, RefreshTokenRecord]:
         with self._lock:
             return dict(self._refresh_by_hash)
+
+    def purge_refresh_history(self, now: float,
+                              retention_seconds: int) -> list[RefreshTokenRecord]:
+        """回收保留窗口已彻底结束的刷新令牌记录，返回被回收的记录。
+
+        一条记录的保留截止时间为 ``expires_at + retention_seconds``：
+        在该时刻之前，对应的刷新令牌仍可能被再次提交（包括已轮换旧令牌
+        在自身过期后的重放判定），因此记录必须保留；过了该时刻，令牌早已
+        无法通过密码学过期校验，绝不可能再换到新令牌，记录才允许回收。
+
+        未过期的令牌（无论是否 used）截止时间必然在未来，绝不会被误回收。
+        """
+        with self._lock:
+            doomed = [r for r in self._refresh_by_jti.values()
+                      if r.expires_at + retention_seconds <= now]
+            for record in doomed:
+                self._refresh_by_jti.pop(record.jti, None)
+                self._refresh_by_hash.pop(record.token_hash, None)
+            return doomed

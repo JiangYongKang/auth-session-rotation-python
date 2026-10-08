@@ -14,6 +14,11 @@ class Settings:
     clock_skew_leeway: int           # 允许的时钟偏差（秒）
     audit_log_path: str
     seed_users: bool
+    # 刷新令牌记录的保留窗口（秒）：记录至少保留到
+    # expires_at + replay_retention_seconds 之后才允许回收。
+    # 在保留窗口内，已轮换的旧刷新令牌即使在自身过期后被重放，
+    # 也依然能被判定为重放；窗口之外提交的一律按过期拒绝（安全兜底）。
+    replay_retention_seconds: int = 30 * 24 * 60 * 60
 
 
 def _env_int(name: str, default: int) -> int:
@@ -29,4 +34,6 @@ def get_settings() -> Settings:
         clock_skew_leeway=_env_int("AUTH_CLOCK_SKEW_LEEWAY", 60),
         audit_log_path=os.environ.get("AUTH_AUDIT_LOG", "data/audit.log.jsonl"),
         seed_users=os.environ.get("AUTH_SEED_USERS", "1") != "0",
+        replay_retention_seconds=_env_int("AUTH_REPLAY_RETENTION_SECONDS",
+                                          30 * 24 * 60 * 60),
     )
