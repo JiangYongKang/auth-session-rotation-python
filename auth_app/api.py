@@ -196,6 +196,21 @@ def create_app(service: AuthService | None = None) -> FastAPI:
         ids = service.revoke_all_user_sessions(user_id)
         return {"status": "ok", "revoked_session_ids": ids}
 
+    # ---- 管理员：有界回收过期的刷新令牌重放历史 ---- #
+    @app.post("/admin/maintenance/replay-history/purge")
+    def purge_replay_history(
+            _: Annotated[dict, Depends(require_permission("user:manage"))],
+            service: Annotated[AuthService, Depends(_service)]):
+        stats = service.purge_replay_history()
+        # 内部用的 jti 列表不必对外暴露。
+        return {
+            "status": "ok",
+            "reaped": stats["reaped"],
+            "remaining": stats["remaining"],
+            "over_limit": stats["over_limit"],
+            "next_eligible_at": stats["next_eligible_at"],
+        }
+
     # ---- 管理员：实时变更角色/权限（立即对已签发会话生效） ---- #
     @app.post("/admin/users/{user_id}/roles")
     def change_roles(user_id: str, body: RoleChangeRequest,

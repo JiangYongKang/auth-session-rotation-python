@@ -114,6 +114,36 @@ def issue_token_pair(user_id: str, session_id: str, roles: set[str],
 _REQUIRED_FIELDS = ("typ", "sub", "sid", "jti", "iat", "exp")
 
 
+def decode_signed_token(token: str, settings: Settings) -> dict:
+    """只验证结构与签名并解码 payload，**不**做过期/时钟偏差判定。
+
+    仅用于“令牌虽已过期、但仍需读取其 jti/hash 以查服务端重放历史”的
+    场景；调用方必须自行保证不会因为拿到 payload 就放行请求。
+    结构非法 / 签名不匹配 / 载荷被改仍然抛 TokenTampered。
+    """
+    if not isinstance(token, str) or token.count(".") != 1:
+        raise TokenTampered("令牌结构不合法")
+
+    payload_b64, sig_b64 = token.split(".", 1)
+    expected_sig = _sign(payload_b64, settings.signing_key)
+    if not hmac.compare_digest(expected_sig, sig_b64):
+        raise TokenTampered("令牌签名校验失败")
+
+    try:
+        payload = json.loads(_b64decode(payload_b64).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise TokenTampered("令牌载荷解码失败") from exc
+
+    if not isinstance(payload, dict):
+        raise TokenTampered("令牌载荷不是对象")
+    for field in _REQUIRED_FIELDS:
+        if field not in payload:
+            raise TokenTampered(f"令牌缺少字段 {field}")
+    if payload["typ"] not in ("access", "refresh"):
+        raise TokenTampered("令牌类型未知")
+    return payload
+
+
 def verify_token(token: str, settings: Settings, clock: Clock,
                  *, expected_type: str | None = None) -> dict:
     """返回 payload；失败时抛出 TokenTampered / ClockSkew / TokenExpired。"""
@@ -152,6 +182,10 @@ def verify_token(token: str, settings: Settings, clock: Clock,
 
     # 过期判定也给予同样的容忍窗口。
     if now > exp + leeway:
-        raise TokenExpired(detail={"exp": exp, "now": now, "leeway": leeway})
+        expired = TokenExpired(detail={"exp": exp, "now": now,
+                                       "leeway": leeway})
+        # 附带已验签的 payload，供调用方在“过期令牌仍需查重放历史”时使用。
+        expired.payload = payload  # type: ignore[attr-defined]
+        raise expired
 
     return payload

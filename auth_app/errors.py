@@ -34,6 +34,12 @@ class TokenExpired(AuthError):
     status_code = 401
     message = "令牌已过期"
 
+    def __init__(self, message: str | None = None, *,
+                 detail: dict | None = None) -> None:
+        super().__init__(message, detail=detail)
+        # 已验签的 payload：过期令牌仍需据此查服务端重放历史；默认 None。
+        self.payload: dict | None = None
+
 
 class TokenTampered(AuthError):
     """令牌签名无效或格式被篡改。"""
@@ -73,6 +79,19 @@ class RefreshTokenInvalid(AuthError):
     code = "refresh_token_invalid"
     status_code = 401
     message = "刷新令牌无效"
+
+
+class RefreshTokenHistoryReaped(AuthError):
+    """令牌在密码学上已过期，且服务端保留窗口内找不到对应历史。
+
+    这属于“超出有界保留范围”的安全拒绝：既不能放行、也不能重新签发，
+    与普通过期（token_expired）、重放（refresh_token_reused）严格区分，
+    detail 中带判断依据（令牌 jti/exp 与当前保留窗口）。
+    """
+
+    code = "refresh_token_history_reaped"
+    status_code = 401
+    message = "刷新令牌历史已超过保留窗口，拒绝访问"
 
 
 class SessionRevoked(AuthError):

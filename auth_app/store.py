@@ -112,3 +112,46 @@ class Store:
     def snapshot_refresh_by_hash(self) -> dict[str, RefreshTokenRecord]:
         with self._lock:
             return dict(self._refresh_by_hash)
+
+    def purge_replay_history(self, now: float,
+                             max_records: int | None = None) -> dict:
+        """有界回收刷新令牌历史。
+
+        主策略是**时间**：只删除 ``now >= record.retain_until`` 的记录。
+        一条记录的 retain_until 不早于其自身过期时刻（含 leeway）之后的
+        保留窗口，因此只要某令牌还可能在保留范围内被再次提交，它的痕迹
+        就不会在这里被清掉。
+
+        ``max_records`` 是防御性背压：当记录总数仍超上限时，本方法也只
+        回收已经可删（retain_until 已过）的部分，**绝不**提前删除尚在
+        保留窗口内的记录——宁可暂时超上限，也不漏判重放。返回统计信息
+        （删除条数、剩余条数、是否仍超限、下一条可回收时间）。
+        """
+        with self._lock:
+            reaped_jtis: list[str] = []
+            for jti, record in list(self._refresh_by_jti.items()):
+                if now >= record.retain_until:
+                    reaped_jtis.append(jti)
+                    del self._refresh_by_jti[jti]
+                    self._refresh_by_hash.pop(record.token_hash, None)
+
+            remaining = len(self._refresh_by_jti)
+            over_limit = (max_records is not None
+                          and remaining > max_records)
+            next_eligible: float | None = None
+            if over_limit:
+                candidates = [r.retain_until
+                              for r in self._refresh_by_jti.values()]
+                if candidates:
+                    next_eligible = min(candidates)
+            return {
+                "reaped": len(reaped_jtis),
+                "remaining": remaining,
+                "reaped_jtis": reaped_jtis,
+                "over_limit": over_limit,
+                "next_eligible_at": next_eligible,
+            }
+
+    def count_refresh_records(self) -> int:
+        with self._lock:
+            return len(self._refresh_by_jti)

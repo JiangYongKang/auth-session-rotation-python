@@ -17,8 +17,6 @@ roles/permissions，角色/权限变化对所有已签发会话立即生效。
 
 from __future__ import annotations
 
-import threading
-
 from . import rbac, tokens
 from .audit import AuditLogger
 from .clock import Clock
@@ -27,9 +25,11 @@ from .errors import (
     InvalidCredentials,
     NotAuthenticated,
     PermissionDenied,
+    RefreshTokenHistoryReaped,
     RefreshTokenInvalid,
     RefreshTokenReused,
     SessionRevoked,
+    TokenExpired,
 )
 from .models import RefreshTokenRecord, Session, TokenPair
 from .security import (
@@ -48,6 +48,8 @@ class AuthService:
         self.settings = settings
         self.clock = clock
         self.audit = audit
+        # 机会式清理重放历史的节流时间戳。
+        self._last_purge_at: float = 0.0
 
     # ------------------------------------------------------------------ #
     # 登录
@@ -82,15 +84,36 @@ class AuthService:
     # 刷新（轮换 + 重放检测 + 并发互斥）
     # ------------------------------------------------------------------ #
     def refresh(self, refresh_token: str) -> TokenPair:
-        # 1) 先做纯密码学校验：过期/篡改/时钟偏差在这里严格区分。
-        payload = tokens.verify_token(
-            refresh_token, self.settings, self.clock, expected_type="refresh")
+        # 1) 先做纯密码学校验：篡改/时钟偏差在这里严格区分。
+        #    注意：**过期的刷新令牌不能在这里直接挡回**——它可能是一张
+        #    早已被轮换掉的旧令牌（过期后才被翻出来重放），必须进入
+        #    服务端状态判定，才能与“从未用过、只是过期”区分清楚。
+        expired_payload: dict | None = None
+        try:
+            payload = tokens.verify_token(
+                refresh_token, self.settings, self.clock,
+                expected_type="refresh")
+        except TokenExpired as exc:
+            expired_payload = exc.payload
+            if expired_payload is None:
+                # 兜底：签名/结构仍要可信，否则按篡改处理，绝不查库放行。
+                expired_payload = tokens.decode_signed_token(
+                    refresh_token, self.settings)
+            payload = expired_payload
 
         token_hash = sha256_hex(refresh_token)
+        is_expired = expired_payload is not None
 
         # 2) 服务端状态判定与签发必须在同一临界区内原子完成。
         with self.store._lock:
+            self._maybe_purge_locked()
             record = self.store.get_refresh_by_hash(token_hash)
+            now = self.clock.now()
+
+            if is_expired:
+                return self._classify_expired_locked(
+                    record, payload, now)
+
             if record is None:
                 # 签名有效但服务端无记录：会话已被撤销 / 令牌从未签发过。
                 self.audit.log("refresh_rejected", user_id=payload.get("sub"),
@@ -144,6 +167,144 @@ class AuthService:
                            old_jti=record.jti,
                            new_jti=payload_of_jti(pair.refresh_token))
             return pair
+
+    def _classify_expired_locked(self, record: RefreshTokenRecord | None,
+                                 payload: dict, now: float) -> TokenPair:
+        """对“密码学上已过期的刷新令牌”做服务端分类。
+
+        结论必须和未过期时稳定一致，且三类严格分开：
+
+        1. 记录存在且 ``used``（曾被成功轮换）-> 重放，撤销整条会话，
+           抛 RefreshTokenReused，绝不重新签发；
+        2. 记录存在但从未使用 -> 普通的“已过期”，抛 TokenExpired；
+           若会话是被外部主动撤销（登出/管理员/单会话撤销），则仍是
+           SessionRevoked；会话因别的令牌重放被撤 -> 仍算重放告警；
+        3. 记录不存在：若仍在有界保留窗口内，说明它从未被成功签发/换走，
+           属普通失效（RefreshTokenInvalid/TokenExpired）；若连保留窗口
+           都过了，则历史已被安全回收，无法证明身份 ->
+           RefreshTokenHistoryReaped，拒绝但绝不放行/重签。
+        """
+        jti = payload.get("jti")
+        user_id = payload.get("sub")
+        session_id = payload.get("sid")
+        exp = float(payload.get("exp", 0.0))
+        leeway = self.settings.clock_skew_leeway
+        retention = self.settings.replay_retention_seconds
+        # 该令牌“理论上最早可被回收”的时刻：自身过期（含 leeway）+ 保留窗口。
+        retain_deadline = exp + leeway + retention
+
+        if record is not None and record.used:
+            # 核心场景：被轮换掉的旧令牌，自己也过期后才被翻出来 -> 重放。
+            self._revoke_session_locked(
+                record.session_id,
+                "refresh_token_reuse:used_token_replayed_after_expiry",
+                triggered_jti=record.jti, user_id=record.user_id)
+            self.audit.log(
+                "refresh_token_reuse_detected",
+                user_id=record.user_id, session_id=record.session_id,
+                jti=record.jti, reason="used_token_replayed_after_expiry",
+                used_at=record.used_at, expired_at=exp, presented_at=now,
+                action="whole_session_revoked")
+            raise RefreshTokenReused(detail={
+                "session_id": record.session_id,
+                "reason": "used_token_replayed_after_expiry",
+                "expired_at": exp, "used_at": record.used_at,
+            })
+
+        if record is not None:
+            session = self.store.get_session(record.session_id)
+            if session is not None and session.revoked and (
+                    session.revoke_reason or "").startswith(
+                        "refresh_token_reuse"):
+                # 令牌本身未使用，但整条链已因别的令牌重放被撤销。
+                self.audit.log(
+                    "refresh_token_reuse_detected",
+                    user_id=record.user_id, session_id=record.session_id,
+                    jti=record.jti, reason=session.revoke_reason,
+                    action="expired_token_from_breached_chain")
+                raise RefreshTokenReused(detail={
+                    "session_id": record.session_id,
+                    "reason": session.revoke_reason})
+
+            if (session is None or session.revoked or record.revoked):
+                # 从未使用、但会话被外部主动撤销：仍按普通会话撤销处理。
+                self.audit.log(
+                    "refresh_rejected", user_id=record.user_id,
+                    session_id=record.session_id, jti=record.jti,
+                    reason="session_revoked", token_expired=True)
+                raise SessionRevoked()
+
+            # 从未被成功使用、只是单纯过期：普通失效，不撤销、不重签。
+            self.audit.log(
+                "refresh_rejected", user_id=record.user_id,
+                session_id=record.session_id, jti=record.jti,
+                reason="expired_never_used", expired_at=exp,
+                presented_at=now)
+            raise TokenExpired(detail={"exp": exp, "now": now,
+                                       "leeway": leeway,
+                                       "reason": "expired_never_used"})
+
+        # record is None：区分“保留窗口内从未存在”与“超过保留窗口”。
+        within_window = now < retain_deadline
+        if within_window:
+            # 还在保留范围内却查无此记录 => 从未被本服务成功签发/换走，
+            # 属普通失效，不能当成重放，更不能重签。
+            self.audit.log(
+                "refresh_rejected", user_id=user_id, session_id=session_id,
+                jti=jti, reason="expired_token_not_found_within_window",
+                expired_at=exp, presented_at=now,
+                retain_deadline=retain_deadline)
+            raise RefreshTokenInvalid(
+                "刷新令牌无效或已过期")
+
+        # 超出有界保留范围：历史已被回收，无法证明这是不是重放。
+        # 安全可解释的结论：拒绝（不放行、不重签）。
+        self.audit.log(
+            "refresh_history_reaped_reject", user_id=user_id,
+            session_id=session_id, jti=jti, expired_at=exp,
+            presented_at=now, retain_deadline=retain_deadline,
+            reason="history_retention_exceeded",
+            action="deny_without_reissue")
+        raise RefreshTokenHistoryReaped(detail={
+            "jti": jti, "expired_at": exp, "presented_at": now,
+            "retain_deadline": retain_deadline,
+            "retention_seconds": retention,
+            "reason": "history_retention_exceeded",
+        })
+
+    # ------------------------------------------------------------------ #
+    # 重放历史的有界回收
+    # ------------------------------------------------------------------ #
+    def purge_replay_history(self) -> dict:
+        """显式回收过期的重放历史（也可供运维/测试直接调用）。"""
+        now = self.clock.now()
+        with self.store._lock:
+            stats = self.store.purge_replay_history(
+                now, self.settings.replay_history_max_records)
+            self._last_purge_at = now
+        self.audit.log("replay_history_purged", **{
+            k: v for k, v in stats.items() if k != "reaped_jtis"
+        }, reaped_jtis=stats["reaped_jtis"][:50],
+            reaped_count=stats["reaped"])
+        return stats
+
+    def _maybe_purge_locked(self) -> None:
+        """在刷新临界区内做节流的机会式回收。
+
+        与查库/签发处于同一把锁，因此清理与并发刷新、并发撤销之间不会
+        出现“先删后判/重复签发”的状态错乱。
+        """
+        now = self.clock.now()
+        if now - self._last_purge_at < \
+                self.settings.replay_purge_interval_seconds:
+            return
+        stats = self.store.purge_replay_history(
+            now, self.settings.replay_history_max_records)
+        self._last_purge_at = now
+        if stats["reaped"] or stats["over_limit"]:
+            self.audit.log("replay_history_purged", **{
+                k: v for k, v in stats.items() if k != "reaped_jtis"
+            }, reaped_count=stats["reaped"], trigger="opportunistic")
 
     # ------------------------------------------------------------------ #
     # 访问令牌认证 / 授权
@@ -252,12 +413,19 @@ class AuthService:
             user_id, session_id, roles, perms, jti,
             self.settings, self.clock)
         now = self.clock.now()
+        expires_at = now + self.settings.refresh_token_ttl
+        # 重放痕迹必须保留到“彻底不可能再换到新令牌”之后：自身过期
+        # （含时钟容忍）+ 有界保留窗口。在此之前清理逻辑不得删除它。
+        retain_until = (expires_at
+                        + self.settings.clock_skew_leeway
+                        + self.settings.replay_retention_seconds)
         record = RefreshTokenRecord(
             jti=jti, session_id=session_id, user_id=user_id,
             token_hash=sha256_hex(pair.refresh_token),
             issued_at=now,
-            expires_at=now + self.settings.refresh_token_ttl,
+            expires_at=expires_at,
             parent_jti=parent_jti,
+            retain_until=retain_until,
         )
         self.store.add_refresh_token(record)
         return pair

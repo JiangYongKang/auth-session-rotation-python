@@ -6,7 +6,6 @@ import pytest
 
 from auth_app.errors import (
     InvalidCredentials,
-    PermissionDenied,
     RefreshTokenReused,
     SessionRevoked,
 )

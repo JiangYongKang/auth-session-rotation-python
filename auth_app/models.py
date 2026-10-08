@@ -39,6 +39,9 @@ class RefreshTokenRecord:
     used_at: float | None = None
     revoked: bool = False
     parent_jti: str | None = None
+    # 重放痕迹保留截止时刻：在此之前（含过期后）记录都不得回收，
+    # 保证过期的轮换旧令牌仍能被判定为重放。
+    retain_until: float = 0.0
 
 
 @dataclass
